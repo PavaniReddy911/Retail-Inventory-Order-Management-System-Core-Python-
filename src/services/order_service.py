@@ -1,79 +1,73 @@
-# src/services/order_service.py
-from typing import List, Dict
-from src.dao.order_dao import OrderDAO
-from src.services.customer_service import CustomerService
-from src.services.product_service import ProductService
+from src.dao import product_dao, order_dao
+from src.services import payments_service
+
+class OrderError(Exception):
+    pass
 
 class OrderService:
-    """Business logic for orders"""
 
-    def __init__(self):
-        self.dao = OrderDAO()
-        self.customer_service = CustomerService()
-        self.product_service = ProductService()
+    @staticmethod
+    def create_order(cust_id: int, items: list[dict]):
+        # Validate customer
+        from src.dao import customer_dao
+        cust = customer_dao.get_customer_by_id(cust_id)
+        if not cust:
+            raise OrderError("Customer not found")
 
-    def create_order(self, customer_id: int, items: List[Dict]) -> str:
-        # Check customer exists
-        customer = self.customer_service.dao.get_by_id(customer_id)
-        if not customer:
-            return f"❌ Customer not found: {customer_id}"
-
-        # Check product stock and calculate total
         total_amount = 0
-        order_items = []
-        for it in items:
-            prod = self.product_service.dao.get_product_by_id(it["prod_id"])
+        # Check stock & calculate total
+        for item in items:
+            prod = product_dao.get_product_by_id(item["prod_id"])
             if not prod:
-                return f"❌ Product not found: {it['prod_id']}"
-            if prod["stock"] < it["quantity"]:
-                return f"❌ Not enough stock for {prod['name']} (available: {prod['stock']})"
-            # Deduct stock
-            new_stock = prod["stock"] - it["quantity"]
-            self.product_service.dao.update_product(prod["prod_id"], {"stock": new_stock})
-            total_amount += prod["price"] * it["quantity"]
-            order_items.append({"prod_id": prod["prod_id"], "quantity": it["quantity"], "price": prod["price"]})
+                raise OrderError(f"Product {item['prod_id']} not found")
+            if prod["stock"] < item["quantity"]:
+                raise OrderError(f"Insufficient stock for product {prod['name']}")
+            total_amount += prod["price"] * item["quantity"]
+
+        # Deduct stock
+        for item in items:
+            prod = product_dao.get_product_by_id(item["prod_id"])
+            new_stock = prod["stock"] - item["quantity"]
+            product_dao.update_product(prod["prod_id"], {"stock": new_stock})
 
         # Create order
-        order = self.dao.create_order(customer_id, total_amount)
-        # Add order items
-        self.dao.add_order_items(order["id"], order_items)
-        return f"✅ Order created: {order}"
+        order = order_dao.create_order(cust_id, total_amount)
+        for item in items:
+            prod = product_dao.get_product_by_id(item["prod_id"])
+            order_dao.create_order_item(order["order_id"], prod["prod_id"], item["quantity"], prod["price"])
 
-    def get_order_details(self, order_id: int) -> Dict:
-        order = self.dao.get_order_by_id(order_id)
-        if not order:
-            return {"error": "Order not found"}
-        items = self.dao.get_items_by_order(order_id)
-        customer = self.customer_service.dao.get_by_id(order["customer_id"])
-        order["customer"] = customer
-        order["items"] = items
+        # Create pending payment
+        payments_service.PaymentService.create_payment(order["order_id"], total_amount)
         return order
 
-    def cancel_order(self, order_id: int) -> str:
-        order = self.dao.get_order_by_id(order_id)
+    @staticmethod
+    def get_order_details(order_id: int):
+        order = order_dao.get_order_by_id(order_id)
         if not order:
-            return "❌ Order not found"
+            raise OrderError("Order not found")
+        items = order_dao.get_order_items(order_id)
+        from src.dao import customer_dao
+        customer = customer_dao.get_customer_by_id(order["cust_id"])
+        return {"order": order, "customer": customer, "items": items}
+
+    @staticmethod
+    def cancel_order(order_id: int):
+        order = order_dao.get_order_by_id(order_id)
+        if not order:
+            raise OrderError("Order not found")
         if order["status"] != "PLACED":
-            return "❌ Only PLACED orders can be cancelled"
+            raise OrderError("Only PLACED orders can be cancelled")
 
         # Restore stock
-        items = self.dao.get_items_by_order(order_id)
-        for it in items:
-            prod = self.product_service.dao.get_product_by_id(it["prod_id"])
-            self.product_service.dao.update_product(prod["prod_id"], {"stock": prod["stock"] + it["quantity"]})
+        items = order_dao.get_order_items(order_id)
+        for item in items:
+            prod = product_dao.get_product_by_id(item["prod_id"])
+            product_dao.update_product(prod["prod_id"], {"stock": prod["stock"] + item["quantity"]})
 
-        updated = self.dao.update_order_status(order_id, "CANCELLED")
-        return f"✅ Order cancelled: {updated}"
+        # Update order status
+        order_dao.update_order(order_id, {"status": "CANCELLED"})
 
-    def complete_order(self, order_id: int) -> str:
-        order = self.dao.get_order_by_id(order_id)
-        if not order:
-            return "❌ Order not found"
-        if order["status"] != "PLACED":
-            return "❌ Only PLACED orders can be completed"
+        # Refund payment
+        payments_service.PaymentService.refund_payment(order_id)
 
-        updated = self.dao.update_order_status(order_id, "COMPLETED")
-        return f"✅ Order completed: {updated}"
-
-    def list_orders_by_customer(self, customer_id: int) -> List[Dict]:
-        return self.dao.get_orders_by_customer(customer_id)
+        return order_dao.get_order_by_id(order_id)
